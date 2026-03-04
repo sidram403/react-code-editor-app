@@ -1,4 +1,4 @@
-import React, { useRef, useCallback, useMemo, useState, useEffect } from 'react';
+import React, { useRef, useCallback, useMemo, useState, useEffect, useImperativeHandle, forwardRef } from 'react';
 import {
     View, TextInput, ScrollView,
     Text, StyleSheet, Platform,
@@ -25,12 +25,11 @@ const KEYWORDS = new Set([
     'type', 'interface', 'enum', 'implements', 'declare', 'abstract', 'override',
 ]);
 
-// Single compiled regex — cheaper than re-compiling every call
 const TOKEN_RE = new RegExp(
     [
         /\/\/[^\n]*/.source,
         /\/\*[\s\S]*?\*\//.source,
-        /`(?:[^`\\]|\\.|\$\{[^}]*\})*`/.source,
+        /`(?:[^`\\]|\\.|(?:\$\{[^}]*\}))*`/.source,
         /"(?:[^"\\]|\\.)*"/.source,
         /'(?:[^'\\]|\\.)*'/.source,
         /\b0x[0-9a-fA-F]+\b/.source,
@@ -50,12 +49,10 @@ function tokenize(code) {
     let last = 0;
     TOKEN_RE.lastIndex = 0;
     let m;
-
     while ((m = TOKEN_RE.exec(code)) !== null) {
         if (m.index > last) out.push({ t: code.slice(last, m.index), c: C.plain });
         const tok = m[0];
         let color = C.plain;
-
         if (tok.startsWith('//') || tok.startsWith('/*')) color = C.comment;
         else if (tok[0] === '"' || tok[0] === "'" || tok[0] === '`') color = C.string;
         else if (/^[0-9]/.test(tok) || tok.startsWith('0x')) color = C.number;
@@ -69,7 +66,6 @@ function tokenize(code) {
         }
         else if (/^[A-Z]/.test(tok)) color = C.component;
         else if (KEYWORDS.has(tok)) color = C.keyword;
-
         out.push({ t: tok, c: color });
         last = m.index + tok.length;
     }
@@ -77,7 +73,6 @@ function tokenize(code) {
     return out;
 }
 
-// Memoised highlight view — only re-tokenises when code actually changes
 const SyntaxView = React.memo(function SyntaxView({ code, style }) {
     const tokens = useMemo(() => tokenize(code || ''), [code]);
     return (
@@ -92,25 +87,90 @@ const SyntaxView = React.memo(function SyntaxView({ code, style }) {
 
 const MONO = Platform.OS === 'ios' ? 'Courier New' : 'monospace';
 
-// ─── Main CodeEditor ──────────────────────────────────────────────────────────
-export default function CodeEditor({ value, onChange }) {
-    // ONE local state drives BOTH layers (TextInput + SyntaxView)
-    // → both update together, zero perceived lag
-    const [localValue, setLocalValue] = useState(value);
-    const parentTimer = useRef(null);
+// ─── Undo / Redo history ─────────────────────────────────────────────────────
+// Simple text-snapshot stack; a new snapshot is pushed every DEBOUNCE ms of
+// inactivity so that individual keystrokes are batched into one undo step.
+const HISTORY_DEBOUNCE = 600; // ms
+const MAX_HISTORY = 200;
 
-    // Sync if parent passes a new value (e.g. file switch via key= remount)
+// ─── Main CodeEditor ─────────────────────────────────────────────────────────
+// Wrapped in forwardRef so the parent can call undo() / redo() via ref
+const CodeEditor = forwardRef(function CodeEditor({ value, onChange }, ref) {
+    const [localValue, setLocalValue] = useState(value);
+
+    // ── History state (undo/redo) ──────────────────────────────────────────
+    const history = useRef([value]);   // snapshots array
+    const histIdx = useRef(0);         // current position
+    const histTimer = useRef(null);    // debounce timer
+    const skipHistory = useRef(false); // true during undo/redo to avoid recording
+
+    // Track whether there's anything to undo/redo (for button disabled state)
+    const [canUndo, setCanUndo] = useState(false);
+    const [canRedo, setCanRedo] = useState(false);
+
+    function refreshFlags() {
+        setCanUndo(histIdx.current > 0);
+        setCanRedo(histIdx.current < history.current.length - 1);
+    }
+
+    // ── Expose undo / redo to parent via ref ──────────────────────────────
+    useImperativeHandle(ref, () => ({
+        undo() {
+            if (histIdx.current <= 0) return;
+            histIdx.current -= 1;
+            const snap = history.current[histIdx.current];
+            skipHistory.current = true;
+            setLocalValue(snap);
+            onChange(snap);
+            refreshFlags();
+        },
+        redo() {
+            if (histIdx.current >= history.current.length - 1) return;
+            histIdx.current += 1;
+            const snap = history.current[histIdx.current];
+            skipHistory.current = true;
+            setLocalValue(snap);
+            onChange(snap);
+            refreshFlags();
+        },
+        canUndo: () => histIdx.current > 0,
+        canRedo: () => histIdx.current < history.current.length - 1,
+    }));
+
+    // ── Sync when parent remounts the component (file switch via key=) ────
     useEffect(() => {
         setLocalValue(value);
+        history.current = [value];
+        histIdx.current = 0;
+        setCanUndo(false);
+        setCanRedo(false);
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []); // intentionally runs once; remount handles file switch
+    }, []); // intentionally once; remount handles file switch
+
+    const parentTimer = useRef(null);
 
     const handleChange = useCallback((text) => {
-        // Immediately visible — drives BOTH input and highlight
         setLocalValue(text);
 
-        // Debounce parent state update (250 ms) — avoids cascading re-renders
-        // in EditorScreen while still keeping project state accurate
+        // Record undo snapshot (debounced)
+        if (!skipHistory.current) {
+            clearTimeout(histTimer.current);
+            histTimer.current = setTimeout(() => {
+                // Truncate forward history if user typed after an undo
+                history.current = history.current.slice(0, histIdx.current + 1);
+                history.current.push(text);
+                if (history.current.length > MAX_HISTORY) {
+                    history.current.shift();
+                } else {
+                    histIdx.current += 1;
+                }
+                refreshFlags();
+            }, HISTORY_DEBOUNCE);
+        } else {
+            skipHistory.current = false;
+        }
+
+        // Debounce parent state update
         clearTimeout(parentTimer.current);
         parentTimer.current = setTimeout(() => onChange(text), 250);
     }, [onChange]);
@@ -134,28 +194,16 @@ export default function CodeEditor({ value, onChange }) {
                 indicatorStyle="white"
             >
                 <View style={styles.editorWrap}>
-                    {/* ── Line-number gutter ── */}
+                    {/* Line-number gutter */}
                     <View style={styles.gutter}>
                         {Array.from({ length: lineCount }, (_, i) => (
                             <Text key={i} style={styles.lineNum}>{i + 1}</Text>
                         ))}
                     </View>
 
-                    {/* ── Code column: highlight underneath, transparent input on top ── */}
+                    {/* Code column */}
                     <View style={styles.codeCol}>
-                        {/*
-             * SyntaxView renders the coloured text.
-             * It is wrapped in React.memo + useMemo so tokenisation only
-             * runs when localValue actually changes — which is every keystroke,
-             * but the regex is fast enough (<1 ms for typical files).
-             */}
                         <SyntaxView code={localValue} style={[codeTextStyle, styles.syntaxLayer]} />
-
-                        {/*
-             * TextInput sits on top with transparent text so the coloured
-             * text shows through, while the cursor, selection, and touch
-             * handling are all native.
-             */}
                         <TextInput
                             value={localValue}
                             onChangeText={handleChange}
@@ -176,7 +224,9 @@ export default function CodeEditor({ value, onChange }) {
             </ScrollView>
         </View>
     );
-}
+});
+
+export default CodeEditor;
 
 const styles = StyleSheet.create({
     root: { flex: 1, backgroundColor: '#0d1117' },

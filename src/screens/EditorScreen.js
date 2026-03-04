@@ -21,9 +21,146 @@ export default function EditorScreen({ route, navigation }) {
     const [showRenameModal, setShowRenameModal] = useState(false);
     const [renameText, setRenameText] = useState(initialProject.name);
     const [consoleLogs, setConsoleLogs] = useState([]);
-    // Track which files have unsaved changes
     const [dirtyFiles, setDirtyFiles] = useState(new Set());
+    const [canUndo, setCanUndo] = useState(false);
+    const [canRedo, setCanRedo] = useState(false);
     const isDirty = dirtyFiles.size > 0;
+
+    const editorRef = useRef(null);   // ref into CodeEditor for undo/redo
+
+    // Refresh undo/redo button enabled state after each undo/redo
+    const handleUndo = useCallback(() => {
+        editorRef.current?.undo();
+        setCanUndo(editorRef.current?.canUndo() ?? false);
+        setCanRedo(editorRef.current?.canRedo() ?? false);
+    }, []);
+    const handleRedo = useCallback(() => {
+        editorRef.current?.redo();
+        setCanUndo(editorRef.current?.canUndo() ?? false);
+        setCanRedo(editorRef.current?.canRedo() ?? false);
+    }, []);
+
+    // ── File / folder management handlers ──────────────────────────────────────
+    const handleAddFile = useCallback((filePath) => {
+        if (!filePath) return;
+        setProject((prev) => {
+            if (prev.files[filePath] !== undefined) return prev; // already exists
+            return { ...prev, files: { ...prev.files, [filePath]: '' } };
+        });
+        setActiveFile(filePath);
+        setShowPreview(false);
+        setDirtyFiles((prev) => new Set([...prev, filePath]));
+    }, []);
+
+    const handleAddFolder = useCallback((folderPath) => {
+        if (!folderPath) return;
+        const normalized = folderPath.replace(/\/$/, ''); // strip trailing slash
+        setProject((prev) => {
+            const existing = prev.folders || [];
+            if (existing.includes(normalized)) return prev;
+            return { ...prev, folders: [...existing, normalized] };
+        });
+    }, []);
+
+    const handleRenameFile = useCallback((oldPath, newPath) => {
+        if (!oldPath || !newPath || oldPath === newPath) return;
+        setProject((prev) => {
+            if (prev.files[newPath] !== undefined) return prev; // target exists — skip
+            const newFiles = { ...prev.files };
+            newFiles[newPath] = newFiles[oldPath];
+            delete newFiles[oldPath];
+            return { ...prev, files: newFiles };
+        });
+        // If the renamed file was active, switch to new path
+        setActiveFile((cur) => (cur === oldPath ? newPath : cur));
+        setDirtyFiles((prev) => {
+            const next = new Set(prev);
+            if (next.has(oldPath)) { next.delete(oldPath); next.add(newPath); }
+            return next;
+        });
+    }, []);
+
+    const handleDeleteFile = useCallback((filePath) => {
+        if (!filePath) return;
+        // Preserve all ancestor folders so they don't disappear from the tree
+        const ancestorFolders = filePath.split('/').slice(0, -1).reduce((acc, seg, i, arr) => {
+            acc.push(arr.slice(0, i + 1).join('/'));
+            return acc;
+        }, []);
+
+        setProject((prev) => {
+            const newFiles = { ...prev.files };
+            delete newFiles[filePath];
+            // Add ancestor folders to project.folders so tree keeps them
+            const existingFolders = prev.folders || [];
+            const newFolders = [...new Set([...existingFolders, ...ancestorFolders])];
+            return { ...prev, files: newFiles, folders: newFolders };
+        });
+        setActiveFile((cur) => {
+            if (cur !== filePath) return cur;
+            const remaining = Object.keys(project.files).filter((f) => f !== filePath);
+            return remaining[0] || '';
+        });
+        setDirtyFiles((prev) => { const next = new Set(prev); next.delete(filePath); return next; });
+    }, [project.files]);
+
+    const handleRenameFolder = useCallback((oldPath, newPath) => {
+        if (!oldPath || !newPath || oldPath === newPath) return;
+        setProject((prev) => {
+            // Rename references in folders[]
+            const newFolders = (prev.folders || []).map((f) => {
+                if (f === oldPath) return newPath;
+                if (f.startsWith(oldPath + '/')) return newPath + f.slice(oldPath.length);
+                return f;
+            });
+            // Rename file keys that start with old path
+            const newFiles = {};
+            Object.entries(prev.files).forEach(([k, v]) => {
+                if (k === oldPath) {
+                    newFiles[newPath] = v;
+                } else if (k.startsWith(oldPath + '/')) {
+                    newFiles[newPath + k.slice(oldPath.length)] = v;
+                } else {
+                    newFiles[k] = v;
+                }
+            });
+            return { ...prev, files: newFiles, folders: newFolders };
+        });
+        // Update activeFile if it was inside the renamed folder
+        setActiveFile((cur) => {
+            if (cur === oldPath) return newPath;
+            if (cur.startsWith(oldPath + '/')) return newPath + cur.slice(oldPath.length);
+            return cur;
+        });
+    }, []);
+
+    const handleDeleteFolder = useCallback((folderPath) => {
+        if (!folderPath) return;
+        setProject((prev) => {
+            // Remove folder and all sub-folders
+            const newFolders = (prev.folders || []).filter(
+                (f) => f !== folderPath && !f.startsWith(folderPath + '/')
+            );
+            // Remove all files inside the folder
+            const newFiles = {};
+            Object.entries(prev.files).forEach(([k, v]) => {
+                if (k !== folderPath && !k.startsWith(folderPath + '/')) {
+                    newFiles[k] = v;
+                }
+            });
+            return { ...prev, files: newFiles, folders: newFolders };
+        });
+        // If active file was inside deleted folder, switch to another
+        setActiveFile((cur) => {
+            if (cur === folderPath || cur.startsWith(folderPath + '/')) {
+                const remaining = Object.keys(project.files).filter(
+                    (f) => f !== folderPath && !f.startsWith(folderPath + '/')
+                );
+                return remaining[0] || '';
+            }
+            return cur;
+        });
+    }, [project.files]);
 
     const previewRef = useRef(null);
 
@@ -48,6 +185,7 @@ export default function EditorScreen({ route, navigation }) {
         setIsRunning(true);
         setConsoleLogs([]);
         setDirtyFiles(new Set());   // save on run → all clean
+        setSidebarOpen(false);      // close sidebar so preview is full-width
         await saveProject(p);
         setShowPreview(true);
         setTimeout(() => {
@@ -137,8 +275,15 @@ export default function EditorScreen({ route, navigation }) {
                 {sidebarOpen && (
                     <FileExplorer
                         files={project.files}
+                        folders={project.folders || []}
                         activeFile={activeFile}
                         onSelectFile={(f) => { setActiveFile(f); setShowPreview(false); }}
+                        onAddFile={handleAddFile}
+                        onAddFolder={handleAddFolder}
+                        onRenameFile={handleRenameFile}
+                        onDeleteFile={handleDeleteFile}
+                        onRenameFolder={handleRenameFolder}
+                        onDeleteFolder={handleDeleteFolder}
                     />
                 )}
 
@@ -146,18 +291,45 @@ export default function EditorScreen({ route, navigation }) {
                 <View style={[styles.panel, showPreview && styles.hidden]}>
                     <View style={styles.tabBar}>
                         <View style={styles.tab}>
-                            {/* 🟢 green = unmodified/clean  🔴 red = modified/unsaved */}
                             <Text style={[
                                 styles.tabDot,
                                 { color: dirtyFiles.has(activeFile) ? '#f85149' : '#3fb950' }
                             ]}>●</Text>
                             <Text style={styles.tabName}>{activeFile}</Text>
                         </View>
+
+                        {/* Undo / Redo buttons — right side of tab bar */}
+                        <View style={styles.undoRedoGroup}>
+                            <TouchableOpacity
+                                style={[styles.undoRedoBtn, !canUndo && styles.undoRedoDim]}
+                                onPress={handleUndo}
+                                disabled={!canUndo}
+                                activeOpacity={0.7}
+                            >
+                                <Text style={styles.undoRedoTxt}>↩</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity
+                                style={[styles.undoRedoBtn, !canRedo && styles.undoRedoDim]}
+                                onPress={handleRedo}
+                                disabled={!canRedo}
+                                activeOpacity={0.7}
+                            >
+                                <Text style={styles.undoRedoTxt}>↪</Text>
+                            </TouchableOpacity>
+                        </View>
                     </View>
                     <CodeEditor
                         key={activeFile}
+                        ref={editorRef}
                         value={project.files[activeFile] || ''}
-                        onChange={handleCodeChange}
+                        onChange={(text) => {
+                            handleCodeChange(text);
+                            // Sync button state after each keystroke (debounced in CodeEditor)
+                            setTimeout(() => {
+                                setCanUndo(editorRef.current?.canUndo() ?? false);
+                                setCanRedo(editorRef.current?.canRedo() ?? false);
+                            }, 700);
+                        }}
                     />
                 </View>
 
@@ -260,9 +432,10 @@ const styles = StyleSheet.create({
     panel: { flex: 1, flexDirection: 'column' },
 
     tabBar: {
-        height: 34, backgroundColor: '#0d1117',
+        height: 36, backgroundColor: '#0d1117',
         borderBottomWidth: 1, borderBottomColor: '#21262d',
-        flexDirection: 'row', alignItems: 'center', paddingHorizontal: 8,
+        flexDirection: 'row', alignItems: 'center',
+        paddingHorizontal: 8, justifyContent: 'space-between',
     },
     tab: {
         flexDirection: 'row', alignItems: 'center', gap: 5,
@@ -271,6 +444,15 @@ const styles = StyleSheet.create({
     },
     tabDot: { color: '#3fb950', fontSize: 7 },
     tabName: { color: '#e6edf3', fontSize: 11, fontWeight: '500' },
+
+    undoRedoGroup: { flexDirection: 'row', gap: 4 },
+    undoRedoBtn: {
+        width: 28, height: 28, borderRadius: 6,
+        backgroundColor: '#21262d', borderWidth: 1, borderColor: '#30363d',
+        alignItems: 'center', justifyContent: 'center',
+    },
+    undoRedoDim: { opacity: 0.3 },
+    undoRedoTxt: { color: '#c9d1d9', fontSize: 15 },
 
     previewBar: {
         height: 34, backgroundColor: '#010409',

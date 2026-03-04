@@ -34,27 +34,28 @@ const PREVIEW_HTML = `
   <script src="https://unpkg.com/@babel/standalone@7.23.5/babel.min.js"></script>
   <script>
     var _reactRoot = null;
+    var _moduleRegistry = {};   // path → exports cache
+    var _sourceRegistry = {};   // path → raw source
 
-    // ── Console interceptor ─────────────────────────────────────
+    // ── Console interceptor ─────────────────────────────────────────────────
     function _sendLog(type, args) {
       var msg = args.map(function(a) {
         try { return typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a); }
         catch(e) { return String(a); }
       }).join(' ');
-      try {
-        window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'CONSOLE', level: type, message: msg }));
-      } catch(_) {}
+      try { window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'CONSOLE', level: type, message: msg })); }
+      catch(_) {}
     }
     var _origLog   = console.log.bind(console);
     var _origWarn  = console.warn.bind(console);
     var _origError = console.error.bind(console);
-    console.log   = function() { _origLog.apply(console, arguments);   _sendLog('log',   Array.from(arguments)); };
-    console.warn  = function() { _origWarn.apply(console, arguments);  _sendLog('warn',  Array.from(arguments)); };
-    console.error = function() { _origError.apply(console, arguments); _sendLog('error', Array.from(arguments)); };
-    window.onerror = function(msg, src, line, col, err) {
+    console.log   = function() { _origLog.apply(console,arguments);   _sendLog('log',   Array.from(arguments)); };
+    console.warn  = function() { _origWarn.apply(console,arguments);  _sendLog('warn',  Array.from(arguments)); };
+    console.error = function() { _origError.apply(console,arguments); _sendLog('error', Array.from(arguments)); };
+    window.onerror = function(msg,src,line,col,err) {
       _sendLog('error', [msg + (line ? ' (line ' + line + ')' : '')]);
     };
-    // ────────────────────────────────────────────────────────────
+    // ────────────────────────────────────────────────────────────────────────
 
     function showErr(msg) {
       document.getElementById('errBox').style.display = 'block';
@@ -64,70 +65,181 @@ const PREVIEW_HTML = `
     function clearErr() { document.getElementById('errBox').style.display = 'none'; }
     function hideIdle() { var el = document.getElementById('idle'); if (el) el.style.display = 'none'; }
 
+    // ── Babel transpile helper ───────────────────────────────────────────────
+    function transpile(src, filename) {
+      return Babel.transform(src, {
+        presets: [
+          ['react', { runtime: 'classic' }],
+          ['typescript', { allExtensions: true, isTSX: true }],
+          ['env', { targets: { ie: '11' }, modules: 'commonjs' }]
+        ],
+        filename: filename || 'file.tsx'
+      }).code;
+    }
+
+    // ── Build all possible lookup keys for a file path ───────────────────────
+    // e.g. 'src/Button.js' → ['src/Button.js','src/Button','./src/Button.js','./src/Button', ...]
+    function pathVariants(filePath) {
+      var base = filePath.replace(/\\.jsx?$/, '').replace(/\\.tsx?$/, '');
+      var withJs  = base + '.js';
+      var withJsx = base + '.jsx';
+      var dotSlash      = './' + filePath;
+      var dotSlashBase  = './' + base;
+      var dotSlashJs    = './' + withJs;
+      var dotSlashJsx   = './' + withJsx;
+      return [filePath, base, withJs, withJsx, dotSlash, dotSlashBase, dotSlashJs, dotSlashJsx];
+    }
+
+    // ── Resolve an import specifier against a calling file's directory ────────
+    function resolveSpecifier(specifier, callerPath) {
+      // Absolute — not relative
+      if (!specifier.startsWith('.')) return specifier;
+
+      // Compute the caller's directory
+      var callerDir = '';
+      var slashIdx = (callerPath || '').lastIndexOf('/');
+      if (slashIdx >= 0) callerDir = callerPath.slice(0, slashIdx);
+
+      // Join caller dir + specifier, then normalise '.' and '..'
+      var raw = callerDir ? callerDir + '/' + specifier : specifier;
+      var parts = raw.split('/');
+      var stack = [];
+      for (var i = 0; i < parts.length; i++) {
+        var p = parts[i];
+        if (p === '' || p === '.') continue;
+        if (p === '..') { stack.pop(); } else { stack.push(p); }
+      }
+      return stack.join('/');
+    }
+
+    // ── require() implementation ─────────────────────────────────────────────
+    function makeRequire(callerPath) {
+      return function req(specifier) {
+        // Built-in shims
+        if (specifier === 'react' || specifier === 'React') return React;
+        if (specifier === 'react-dom' || specifier === 'ReactDOM') return ReactDOM;
+
+        // Resolve relative paths
+        var resolved = resolveSpecifier(specifier, callerPath);
+
+        // Check cache first
+        if (_moduleRegistry[resolved]) return _moduleRegistry[resolved];
+
+        // Try all path variants in the registry
+        var variants = pathVariants(resolved);
+        for (var vi = 0; vi < variants.length; vi++) {
+          if (_moduleRegistry[variants[vi]]) return _moduleRegistry[variants[vi]];
+        }
+
+        // Find source in the source registry
+        var src = null;
+        var srcKey = null;
+        for (var vj = 0; vj < variants.length; vj++) {
+          if (_sourceRegistry[variants[vj]] !== undefined) {
+            src = _sourceRegistry[variants[vj]];
+            srcKey = variants[vj];
+            break;
+          }
+        }
+
+        if (src === null) {
+          // Not found — return empty object (graceful degradation)
+          console.warn('Module not found: ' + specifier + ' (resolved: ' + resolved + ')');
+          return {};
+        }
+
+        // CSS file → inject into page, return {}
+        if (srcKey.endsWith('.css')) {
+          var existing = document.getElementById('css_' + srcKey.replace(/[^a-z0-9]/gi, '_'));
+          if (!existing) {
+            var tag = document.createElement('style');
+            tag.id = 'css_' + srcKey.replace(/[^a-z0-9]/gi, '_');
+            tag.textContent = src;
+            document.head.appendChild(tag);
+          } else {
+            existing.textContent = src;
+          }
+          return {};
+        }
+
+        // Transpile and execute
+        var exp = { __esModule: true };
+        var mod = { exports: exp };
+        _moduleRegistry[srcKey] = exp;   // set before exec to handle circular deps
+
+        var code = transpile(src, srcKey);
+        try {
+          (new Function('React', 'exports', 'module', 'require',
+            '"use strict";\\n' + code
+          ))(React, exp, mod, makeRequire(srcKey));
+        } catch (e) {
+          delete _moduleRegistry[srcKey];
+          throw new Error('Error in ' + srcKey + ': ' + e.message);
+        }
+
+        // Merge mod.exports into exp for CommonJS style exports
+        if (mod.exports !== exp) {
+          _moduleRegistry[srcKey] = mod.exports;
+          return mod.exports;
+        }
+        return exp;
+      };
+    }
+
+    // ── Main compile function ────────────────────────────────────────────────
     function compile(files) {
       clearErr();
       hideIdle();
+
+      // Reset registries
+      _moduleRegistry = {};
+      _sourceRegistry = {};
+
       try {
-        // 1. Inject user CSS
+        // 1. Register all files in the source registry
+        Object.keys(files).forEach(function(path) {
+          var variants = pathVariants(path);
+          variants.forEach(function(v) { _sourceRegistry[v] = files[path]; });
+        });
+
+        // 2. Inject the main App CSS into the dedicated <style> tag
         document.getElementById('appCss').textContent = files['App.css'] || '';
 
-        // 2. Get App.js source
-        var src = files['App.js'] || '';
+        // 3. Get and prepare App.js
+        var appSrc = files['App.js'] || '';
 
-        // 3. Strip CSS import lines  (import './App.css')
-        src = src.replace(/^\\s*import\\s+['"](\\.?\\/)?App\\.css['"]\\s*;?\\s*$/mg, '');
+        // Strip bare App.css import (it's already injected above)
+        appSrc = appSrc.replace(/^\\s*import\\s+['"](\\.\\/)?App\\.css['"]\\s*;?\\s*$/mg, '');
 
-        // 4. Strip other relative imports that can't be resolved in sandbox
-        src = src.replace(/^\\s*import\\s+.*\\s+from\\s+['"]\\.\\.?\\/.+['"]\\s*;?\\s*$/mg, '');
-
-        // 5. Auto-inject React import when missing
-        //    (classic JSX runtime needs React in scope for createElement)
-        if (!/(^|\\n)\\s*import\\s+React[\\s,{]/.test(src)) {
-          src = 'import React from "react";\\n' + src;
+        // Auto-inject React import if missing
+        if (!/(^|\\n)\\s*import\\s+React[\\s,{]/.test(appSrc)) {
+          appSrc = 'import React from "react";\\n' + appSrc;
         }
 
-        // 6. Transpile with Babel
-        //    - 'react'      : JSX → React.createElement
-        //    - 'typescript' : strips TypeScript generics (useState<number>, etc.)
-        //    - 'env'        : modern JS → CommonJS modules
-        var output = Babel.transform(src, {
-          presets: [
-            ['react', { runtime: 'classic' }],
-            ['typescript', { allExtensions: true, isTSX: true }],
-            ['env', { targets: { ie: '11' }, modules: 'commonjs' }]
-          ],
-          filename: 'App.tsx'
-        }).code;
+        // 4. Transpile App.js
+        var code = transpile(appSrc, 'App.tsx');
 
-        // 7. Set up CommonJS module environment
+        // 5. Execute with our require that knows about all files
         var exp = { __esModule: true };
         var mod = { exports: exp };
-        var req = function (id) {
-          if (id === 'react' || id === 'React') return React;
-          if (id === 'react-dom' || id === 'ReactDOM') return ReactDOM;
-          return {};
-        };
-
-        // 8. Execute transpiled code in a sandboxed function scope
         (new Function('React', 'exports', 'module', 'require',
-          '"use strict";\\n' + output
-        ))(React, exp, mod, req);
+          '"use strict";\\n' + code
+        ))(React, exp, mod, makeRequire('App.js'));
 
-        // 9. Resolve default export
+        // 6. Resolve default export
         var App = exp.default || mod.exports.default || mod.exports;
-
         if (typeof App !== 'function') {
           showErr('No default export found.\\nMake sure App.js has:\\n  export default function App() { ... }');
           return;
         }
 
-        // 10. Mount / re-render into #root
+        // 7. Mount / re-render
         var container = document.getElementById('root');
         if (!_reactRoot) { _reactRoot = ReactDOM.createRoot(container); }
         _reactRoot.render(React.createElement(App));
 
-      } catch (e) {
-        showErr(e.message + (e.stack ? '\\n\\n' + e.stack.slice(0, 500) : ''));
+      } catch(e) {
+        showErr(e.message + (e.stack ? '\\n\\n' + e.stack.slice(0, 600) : ''));
       }
     }
 
@@ -135,7 +247,7 @@ const PREVIEW_HTML = `
       try {
         var d = JSON.parse(e.data);
         if (d.type === 'RUN') compile(d.files);
-      } catch (_) {}
+      } catch(_) {}
     }
     window.addEventListener('message', onMsg);
     document.addEventListener('message', onMsg);
